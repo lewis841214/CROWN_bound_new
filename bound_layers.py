@@ -206,7 +206,30 @@ class BoundConv2d(Conv2d):
         upper = center + deviation
         lower = center - deviation
         return np.inf, upper, lower, 0, 0, 0, 0
-    
+
+
+class BoundReLU(ReLU):
+    def __init__(self, prev_layer, inplace=False, bound_opts=None):
+        super(BoundReLU, self).__init__(inplace)
+        # ReLU needs the previous layer's bounds
+        # self.prev_layer = prev_layer
+        self.bound_opts = bound_opts
+
+    ## Convert a ReLU layer to BoundReLU layer
+    # @param act_layer ReLU layer object
+    # @param prev_layer Pre-activation layer, used for get preactivation bounds
+    @staticmethod
+    def convert(act_layer, prev_layer, bound_opts=None):
+        l = BoundReLU(prev_layer, act_layer.inplace, bound_opts)
+        return l
+
+    def interval_propagate(self, norm, h_U, h_L, eps):
+
+
+    def bound_backward(self, last_uA, last_lA):
+
+
+
 class BoundReLU(ReLU):
     def __init__(self, prev_layer, inplace=False, bound_opts=None):
         super(BoundReLU, self).__init__(inplace)
