@@ -8,7 +8,7 @@
 import torch
 import numpy as np
 from torch.nn import DataParallel
-from torch.nn import Sequential, Conv2d, Linear, ReLU
+from torch.nn import Sequential, Conv2d, Linear, ReLU,MaxPool2d
 from model_defs import Flatten, model_mlp_any
 import torch.nn.functional as F
 from itertools import chain
@@ -94,6 +94,7 @@ class BoundLinear(Linear):
 
         if norm == np.inf:
             # Linf norm
+
             mid = (h_U + h_L) / 2.0
             diff = (h_U - h_L) / 2.0
             weight_abs = weight.abs()
@@ -157,14 +158,21 @@ class BoundConv2d(Conv2d):
             if compute_A:
                 
                 output_padding0 = int(self.input_shape[1]) - (int(self.output_shape[1]) - 1) * self.stride[0] + 2 * self.padding[0] - int(self.weight.size()[2])
-                output_padding1 = int(self.input_shape[2]) - (int(self.output_shape[2]) - 1) * self.stride[1] + 2 * self.padding[1] - int(self.weight.size()[3]) 
+                output_padding1 = int(self.input_shape[2]) - (int(self.output_shape[2]) - 1) * self.stride[1] + 2 * self.padding[1] - int(self.weight.size()[3])
+                #print('self.weight ',self.weight.shape)
+                print('check how BoundConv2d change size of last u_A')
                 next_A = F.conv_transpose2d(last_A.view(shape[0] * shape[1], *shape[2:]), self.weight, None, stride=self.stride, padding=self.padding, dilation=self.dilation, groups=self.groups, output_padding=(output_padding0, output_padding1))
+
                 next_A = next_A.view(shape[0], shape[1], *next_A.shape[1:])
                 logger.debug('next_A %s', next_A.size())
             else:
                 next_A = False
             logger.debug('bias %s', self.bias.size())
             # dot product, compute the bias of this layer, do a dot product
+            print('last_A',last_A)
+            print('last_A.sum((3,4)',last_A.sum((3,4)))
+            print('self.bias',self.bias)
+            print('last_A.sum((3,4)) * self.bias',last_A.sum((3,4)) * self.bias)
             sum_bias = (last_A.sum((3,4)) * self.bias).sum(2)
             logger.debug('sum_bias %s', sum_bias.size()) 
             return next_A, sum_bias
@@ -177,10 +185,13 @@ class BoundConv2d(Conv2d):
         else:
             uA, ubias = _bound_oneside(last_uA)
             lA, lbias = _bound_oneside(last_lA)
+        print('In conv2d ubias,lbias',ubias, lbias)
         return uA, ubias, lA, lbias
 
     def interval_propagate(self, norm, h_U, h_L, eps):
+
         if norm == np.inf:
+            print('IN Conv IBP function', h_U, h_L)
             mid = (h_U + h_L) / 2.0
             diff = (h_U - h_L) / 2.0
             weight_abs = self.weight.abs()
@@ -205,28 +216,94 @@ class BoundConv2d(Conv2d):
         logger.debug('center %s', center.size())
         upper = center + deviation
         lower = center - deviation
+        print('in CONV IBP')
+        print('center',center)
+        print('lower',lower)
         return np.inf, upper, lower, 0, 0, 0, 0
 
-
-class BoundReLU(ReLU):
-    def __init__(self, prev_layer, inplace=False, bound_opts=None):
-        super(BoundReLU, self).__init__(inplace)
+#Get upper and
+class BoundMaxPool(MaxPool2d):
+    def __init__(self, kernel_size=2, stride=None, padding=0,dilation=1, return_indices=False, bound_opts={'one-lb':False, 'max_pool':'Ehlers'}):
+        super(BoundMaxPool, self).__init__(kernel_size=2, stride=stride, padding=0,dilation=1, return_indices=False)
         # ReLU needs the previous layer's bounds
         # self.prev_layer = prev_layer
         self.bound_opts = bound_opts
-
-    ## Convert a ReLU layer to BoundReLU layer
+        #temp initialized
+        self.upper_u = 10000
+        self.lower_l = -10000
+        ## Convert a ReLU layer to BoundReLU layer
     # @param act_layer ReLU layer object
     # @param prev_layer Pre-activation layer, used for get preactivation bounds
     @staticmethod
-    def convert(act_layer, prev_layer, bound_opts=None):
-        l = BoundReLU(prev_layer, act_layer.inplace, bound_opts)
-        return l
+    def convert(l, bound_opts=None):
+        #print('in Maxpool bound backward', super(BoundMaxPool, self).kernel_size)
+        #Fiest ptint out max_pooling parameters
+        #print('max_pooling_here')
+        #print('l.kernel_size, l.stride, l.padding, l.dilation, bound_opts',l.kernel_size, l.stride, l.padding, l.dilation, bound_opts)
+        nl = BoundMaxPool(l.kernel_size, l.stride, l.padding, l.dilation, bound_opts)
+        nl.kernel_size=l.kernel_size
+        nl.stride=l.stride
+        #print('in Maxpool convert', nl.kernel_size)
+        #print('in Maxpool convert: stride', nl.stride)
+        return nl
 
-    def interval_propagate(self, norm, h_U, h_L, eps):
+    def forward(self, input):
+        print('shape input',input.shape)
+        output = super(BoundMaxPool, self).forward(input)
+        self.output_shape = output.size()[1:]
+        self.input_shape = input.size()[1:]
+        return output
+    #def interval_propagate(self, norm, h_U, h_L, eps):
+#        output = super(BoundConv2d, self).forward(input)
 
 
     def bound_backward(self, last_uA, last_lA):
+        lb_r = self.lower_l#.clamp(max=0)
+        ub_r = self.upper_u#.clamp(min=0)
+        # avoid division by 0 when both lb_r and ub_r are 0
+        #ub_r = torch.max(ub_r, lb_r + 1e-8)
+        #torch.nn.functional.conv_transpose2d(input, weight, bias=None, stride=1, padding=0, output_padding=0, groups=1, dilation=1) → Tensor
+        print('in Maxpool beginning',self.kernel_size)
+        print(self.bound_opts)
+        if self.bound_opts['max_pool']=='Ehlers':
+            #create weight metrix
+            w=torch.zeros((self.input_shape[0], self.output_shape[0], self.kernel_size, self.kernel_size))
+            #inpur ch should be same as output ch
+            # make it 1 because the weight should be 1, when max-pooling sellect it.
+            for i in range(self.input_shape[0]):
+                for j in range(self.kernel_size):
+                    for k in range(self.kernel_size):
+                        w[i][i][j][k]=1
+            #new_uA and new_lA doesn't need sellection but b needs.
+            #upper=sum(z)+max(lb)+sum(lb)
+            #lower=sum(z)+max(u)-sum(u)
+            #Stated in A Convex Relaxation Barrier to Tight Robustness Veriﬁcation of Neural Networks
+            upper_d=self.forward(lb_r)+F.conv2d(lb_r,w, None, self.stride)
+            lower_d=self.forward(ub_r)-F.conv2d(ub_r,w, None, self.stride)
+            print('ubr lbr',ub_r, lb_r)
+            print('upper_b',upper_d)
+            print('lower_b',lower_d)
+            print('self.forward(lb_r)',self.forward(lb_r))
+            print('F.conv_transpose2d(lb_r,w, None, self.stride)',F.conv_transpose2d(lb_r,w, None, self.stride))
+            if last_uA!=None:
+                shape=last_uA.shape
+                #TODO: Tommorow start here
+                next_uA=F.conv_transpose2d(last_uA.view(shape[0] * shape[1], *shape[2:]),w, None, self.stride)
+                next_uA=next_uA.view(shape[0], shape[1], *next_uA.shape[1:])
+                upper_mulAb=torch.sum(last_uA.clamp(min=0)*upper_d+last_uA.clamp(max=0)*lower_d)
+            else:
+                next_uA, upper_mulAb=None, None
+            if last_lA!=None:
+                shape=last_lA.shape
+                next_lA=F.conv_transpose2d(last_lA.view(shape[0] * shape[1], *shape[2:]),w, None, self.stride)
+                next_lA = next_lA.view(shape[0], shape[1], *next_lA.shape[1:])
+                lower_mulAb = torch.sum(last_uA.clamp(min=0) * lower_d + last_uA.clamp(max=0) * upper_d)
+            else:
+                new_lA, lower_mulAb=None, None
+            uA, ubias, lA, lbias=next_uA, upper_mulAb, next_lA, lower_mulAb
+            print('in max_pooling end',uA, ubias, lA, lbias)
+            return uA, ubias, lA, lbias
+
 
 
 
@@ -290,8 +367,8 @@ class BoundReLU(ReLU):
                 neg_uA = last_uA.clamp(max=0)
                 uA = upper_d * pos_uA + lower_d * neg_uA
             mult_uA = pos_uA.view(last_uA.size(0), last_uA.size(1), -1)
-            print('mult_uA',mult_uA.shape)
-            print('upper_b.view(upper_b.size(0)',upper_b.view(upper_b.size(0), -1, 1).shape)
+            #print('mult_uA',mult_uA.shape)
+            #print('upper_b.view(upper_b.size(0)',upper_b.view(upper_b.size(0), -1, 1).shape)
             ubias = mult_uA.matmul(upper_b.view(upper_b.size(0), -1, 1)).squeeze(-1)
         if last_lA is not None:
             neg_lA = last_lA.clamp(max=0)
@@ -304,6 +381,7 @@ class BoundReLU(ReLU):
             mult_lA = neg_lA.view(last_lA.size(0), last_lA.size(1), -1)
             #lbias = mult_lA.matmul(upper_b.view(upper_b.size(0), -1, 1)).squeeze(-1)
             lbias = mult_lA.matmul(upper_b.view(upper_b.size(0), -1,1)).squeeze(-1)
+        print('uA, ubias, lA, lbias',uA, ubias, lA, lbias)
         return uA, ubias, lA, lbias
 
 
@@ -318,21 +396,53 @@ class BoundSequential(Sequential):
     #################
     #bound_opts is a dict
     ################
-    def convert(sequential_model, bound_opts={'one-lb':False}):
+    def convert(sequential_model, bound_opts={'one-lb':False, 'max_pool':'Ehlers'}):
+        print('#############')
+        print('start converting model')
         layers = []
         if isinstance(sequential_model, Sequential):
             seq_model = sequential_model
         else:
             seq_model = sequential_model.module
+        #TODO: Add linear out features
+        out_ch=1
+        chek_Conv=True
         for l in seq_model:
             if isinstance(l, Linear):
                 layers.append(BoundLinear.convert(l, bound_opts))
+                print('Linear weight and bias', l.weight, l.bias)
             if isinstance(l, Conv2d):
+                print('conv2d',l)
+                print('conv2d weight and bias', l.weight, l.bias)
+                out_ch=l.out_channels
                 layers.append(BoundConv2d.convert(l, bound_opts))
             if isinstance(l, ReLU):
                 layers.append(BoundReLU.convert(l, layers[-1], bound_opts))
+                if chek_Conv==True:
+                    new_id=Conv2d(out_ch,out_ch,1)
+                    #print('new_id.weight',new_id.weight)
+                    new_id.weight[0][0][0][0]=1.0
+                    #print(new_id.bias)
+                    new_id.bias[0]=0.0
+                    #print('new_id.weight', new_id.weight)
+                    layers.append(BoundConv2d.convert(new_id,  bound_opts))
             if isinstance(l, Flatten):
                 layers.append(BoundFlatten(bound_opts))
+                chek_Conv=False
+            #BoundMaxPool
+            if isinstance(l, MaxPool2d):
+                print('hiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii')
+                layers.append(BoundMaxPool.convert(l, bound_opts))
+                if chek_Conv==True:
+                    new_id=Conv2d(out_ch,out_ch,1)
+                    #print('new_id.weight',new_id.weight)
+                    new_id.weight[0][0][0][0]=1.0
+                    #print(new_id.bias)
+                    new_id.bias[0] = 0.0
+                    #print('new_id.weight', new_id.weight)
+                    layers.append(BoundConv2d.convert(new_id,  bound_opts))
+                #new_id=Conv2d( )
+        print('finish converting model')
         return BoundSequential(*layers)
 
     ## The __call__ function is overwritten for DataParallel
@@ -369,23 +479,34 @@ class BoundSequential(Sequential):
         #save shape here
         save_shape = x_U
         modules = list(self._modules.values())
-
+        print('#####################')
+        print('start computing CROWN bound')
+        print('printing modules and forward passing')
         for i, module in enumerate(modules):
-            if isinstance(module, BoundConv2d) or isinstance(module, BoundLinear):
-                print(i,module,module.weight)
-                print(i, module, module.bias)
+            #if isinstance(module, BoundConv2d) or isinstance(module, BoundLinear):
+            #    print(i,module,module.weight)
+            #    print(i, module, module.bias)
+           #elif isinstance(module, BoundMaxPool)
+            print(i, module)
+
             save_shape=module(save_shape)
+        print('end forward passing')
+        print('##############')
         # IBP through the first weight (it is the same bound as CROWN for 1st layer, and IBP can be faster)
+        print('start doing IBP until ReLU or MaxPool')
         h_U = x_U
         h_L = x_L
         for i, module in enumerate(modules):
             norm, h_U, h_L, _, _, _, _ = module.interval_propagate(norm, h_U, h_L, eps)
+            print('in IBP', i,'th module',module, h_U,h_L)
             save_shape=h_U
             # skip the first flatten and linear layer, until we reach the first ReLU layer
-            if isinstance(module, BoundReLU):
+            if isinstance(module, BoundReLU) :#or isinstance(module, BoundMaxPool):
                 # now the upper and lower bound of this ReLU layer has been set in interval_propagate()
                 last_module = i
                 break
+        print('IBP result:', h_U, h_L)
+        print('End IBP')
         # CROWN propagation for all rest layers
         # outer loop, starting from the 2nd layer until we reach the output layer
         ###############
@@ -394,11 +515,16 @@ class BoundSequential(Sequential):
 
         #print(x_U)
        # print(x_L)
+        #from
+        print('################')
+        print('start backwarding ')
+        print('haven\' deal with the case that ReLU->MaxPool')
         for i in range(last_module + 1, len(modules)):
             # we do not need bounds after ReLU/flatten layers; we only need the bounds
             # before a ReLU layer
-            if isinstance(modules[i], BoundReLU):
+            if isinstance(modules[i], BoundReLU) or isinstance(modules[i], BoundMaxPool):
                 # we set C as the weight of previous layer
+                print('start backward', modules[i])
                 if isinstance(modules[i-1], BoundLinear):
                     print('BoundLinear',i-1)
                     # add a batch dimension; all images have the same C in this case
@@ -425,6 +551,7 @@ class BoundSequential(Sequential):
                 else:
                     raise RuntimeError("Unsupported network structure")
                 # set pre-activation bounds for layer i (the ReLU layer)
+                print('Computed concrete bound:',ub, lb)
                 modules[i].upper_u = ub
                 modules[i].lower_l = lb
         # get the final layer bound with spec C
@@ -456,8 +583,13 @@ class BoundSequential(Sequential):
             #module(upper_A)
             upper_A, upper_b, lower_A, lower_b = module.bound_backward(upper_A, lower_A)
             # squeeze is for using broadcasting in the cast that all examples use the same spec
+
             upper_sum_b = upper_b + upper_sum_b
             lower_sum_b = lower_b + lower_sum_b
+            print('upper_b',upper_b)
+            print('lower_b',lower_b)
+            print('upper_sum_b',upper_sum_b)
+            print('lower_sum_b',lower_sum_b)
         # sign = +1: upper bound, sign = -1: lower bound
         def _get_concrete_bound(A, sum_b, sign = -1):
             if A is None:
@@ -466,8 +598,12 @@ class BoundSequential(Sequential):
             # A has shape (batch, specification_size, flattened_input_size)
             logger.debug('Final A: %s', A.size())
             if norm == np.inf:
+                print('in computing BOund')
+                #print('x_u',x_ub)
                 x_ub = x_U.view(x_U.size(0), -1, 1)
                 x_lb = x_L.view(x_L.size(0), -1, 1)
+                print('x_u', x_ub)
+                print('x_l',x_lb)
                 center = (x_ub + x_lb) / 2.0
                 diff = (x_ub - x_lb) / 2.0
                 logger.debug('A_0 shape: %s', A.size())
@@ -475,6 +611,7 @@ class BoundSequential(Sequential):
                 # we only need the lower bound
                 bound = A.bmm(center) + sign * A.abs().bmm(diff)
                 logger.debug('bound shape: %s', bound.size())
+                print('bound',bound)
             else:
                 x = x_U.view(x_U.size(0), -1, 1)
                 dual_norm = np.float64(1.0) / (1 - 1.0 / norm)
